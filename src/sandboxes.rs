@@ -18,8 +18,12 @@ use std::sync::{Arc, Mutex};
 use crate::http::{read_body, Request, ResponseWriter};
 use crate::{now_ms, State};
 
-/// First uid handed out; far above any uid shipped in common images.
-const UID_BASE: u32 = 100_000;
+/// First uid handed out. On HF Jobs the container runs in a user namespace that
+/// maps only uids 0..65535, so setuid() to anything above that fails with EINVAL.
+/// We stay inside the mapped range and above the uids common images use for
+/// their service accounts (which top out in the low thousands; `nobody`=65534).
+const UID_BASE: u32 = 20_000;
+const UID_MAX: u32 = 65_000;
 const HOMES_DIR: &str = "/sbx/homes";
 
 /// Default per-sandbox rlimits (overridable per sandbox at creation).
@@ -59,7 +63,14 @@ impl SandboxRegistry {
         max_procs: Option<u64>,
         max_mem_mb: Option<u64>,
     ) -> std::io::Result<Arc<SandboxEntry>> {
-        let uid = UID_BASE + self.next_uid.fetch_add(1, Ordering::SeqCst);
+        let offset = self.next_uid.fetch_add(1, Ordering::SeqCst);
+        let uid = UID_BASE + offset;
+        if uid >= UID_MAX {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                format!("sandbox uid pool exhausted (max {} concurrent sandboxes per host)", UID_MAX - UID_BASE),
+            ));
+        }
         let id = random_id();
         let home = format!("{HOMES_DIR}/{id}");
         std::fs::create_dir_all(&home)?;
