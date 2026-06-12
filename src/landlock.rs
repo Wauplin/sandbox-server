@@ -14,8 +14,13 @@
 //!     symlink-squat and cross-home channels),
 //!   - bind a TCP port (closes inter-sandbox localhost services — outbound
 //!     connect stays allowed so the sandbox keeps internet access),
-//!   - connect to abstract unix sockets outside its domain, or signal processes
-//!     outside its domain (ABI 6 scoping; defense-in-depth over uid isolation).
+//!   - connect to abstract unix sockets outside its domain (ABI 6 scoping —
+//!     uid isolation alone does NOT block cross-uid abstract sockets).
+//!
+//! We deliberately do NOT scope signals: cross-sandbox signals are already
+//! blocked by the distinct uids, and signal-scoping is per-Landlock-domain —
+//! since every exec gets its own domain, it would stop a sandbox from signaling
+//! its OWN background processes started in earlier exec calls.
 //!
 //! Implemented with raw syscalls to stay a zero-dependency static binary.
 
@@ -46,7 +51,6 @@ const NET_BIND_TCP: u64 = 1 << 0;
 
 // scoped bits (ABI 6)
 const SCOPED_ABSTRACT_UNIX_SOCKET: u64 = 1 << 0;
-const SCOPED_SIGNAL: u64 = 1 << 1;
 
 #[repr(C)]
 struct RulesetAttr {
@@ -111,7 +115,7 @@ pub fn build_ruleset(home: &str) -> Option<RawFd> {
     }
     // Control TCP bind only (leave connect unrestricted → outbound internet works).
     let handled_net = if abi >= 4 { NET_BIND_TCP } else { 0 };
-    let scoped = if abi >= 6 { SCOPED_ABSTRACT_UNIX_SOCKET | SCOPED_SIGNAL } else { 0 };
+    let scoped = if abi >= 6 { SCOPED_ABSTRACT_UNIX_SOCKET } else { 0 };
 
     let attr = RulesetAttr { handled_access_fs: handled_fs, handled_access_net: handled_net, scoped };
     let ruleset_fd = unsafe {
