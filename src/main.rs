@@ -72,19 +72,9 @@ fn route(
 
     let segments: Vec<&str> = path.trim_matches('/').split('/').collect();
     match (method.as_str(), segments.as_slice()) {
+        // ---- dedicated mode: operate directly on the job (one job == one sandbox) ----
         ("POST", ["v1", "exec"]) => exec::handle_exec(state, request, reader, resp, None),
-        ("POST", ["v1", "sandboxes"]) => sandboxes::handle_create(state, request, reader, resp),
-        ("GET", ["v1", "sandboxes"]) => resp.json(200, &state.sandboxes.list()),
-        ("DELETE", ["v1", "sandboxes"]) => sandboxes::handle_delete_all(state, resp),
-        ("DELETE", ["v1", "sandboxes", id]) => {
-            let id = id.to_string();
-            sandboxes::handle_delete(state, &id, resp)
-        }
-        ("POST", ["v1", "sandboxes", id, "exec"]) => match state.sandboxes.get(id) {
-            Some(entry) => exec::handle_exec(state, request, reader, resp, Some(entry)),
-            None => resp.error(404, &format!("no such sandbox: {id}")),
-        },
-        ("GET", ["v1", "procs"]) => resp.json(200, &state.procs.list()),
+        ("GET", ["v1", "procs"]) => resp.json(200, &state.procs.list(None)),
         ("GET", ["v1", "procs", pid, "logs"]) => exec::handle_logs(state, pid, &request.params, resp),
         ("GET", ["v1", "procs", pid, "wait"]) => exec::handle_wait(state, pid, resp),
         ("POST", ["v1", "procs", pid, "kill"]) => {
@@ -95,13 +85,74 @@ fn route(
             let pid = pid.to_string();
             exec::handle_stdin(state, request, reader, &pid, resp)
         }
-        ("GET", ["v1", "files", "read"]) => files::handle_read(request, resp),
-        ("PUT", ["v1", "files", "write"]) => files::handle_write(request, reader, resp),
-        ("GET", ["v1", "files", "list"]) => files::handle_list(request, resp),
-        ("GET", ["v1", "files", "stat"]) => files::handle_stat(request, resp),
-        ("DELETE", ["v1", "files", "delete"]) => files::handle_delete(request, resp),
-        ("POST", ["v1", "files", "mkdir"]) => files::handle_mkdir(request, resp),
+        ("GET", ["v1", "files", "read"]) => files::handle_read(request, resp, None),
+        ("PUT", ["v1", "files", "write"]) => files::handle_write(request, reader, resp, None),
+        ("GET", ["v1", "files", "list"]) => files::handle_list(request, resp, None),
+        ("GET", ["v1", "files", "stat"]) => files::handle_stat(request, resp, None),
+        ("DELETE", ["v1", "files", "delete"]) => files::handle_delete(request, resp, None),
+        ("POST", ["v1", "files", "mkdir"]) => files::handle_mkdir(request, resp, None),
+
+        // ---- host mode: many lightweight sandboxes inside this job ----
+        ("POST", ["v1", "sandboxes"]) => sandboxes::handle_create(state, request, reader, resp),
+        ("GET", ["v1", "sandboxes"]) => resp.json(200, &state.sandboxes.list()),
+        ("DELETE", ["v1", "sandboxes"]) => sandboxes::handle_delete_all(state, resp),
+        ("DELETE", ["v1", "sandboxes", id]) => {
+            let id = id.to_string();
+            sandboxes::handle_delete(state, &id, resp)
+        }
+        // Per-sandbox operations mirror the dedicated routes, scoped to one sandbox
+        // (its uid, its home, its processes). The client uses the same surface for
+        // both modes, only the URL prefix differs.
+        ("POST", ["v1", "sandboxes", id, "exec"]) => match state.sandboxes.get(id) {
+            Some(entry) => exec::handle_exec(state, request, reader, resp, Some(entry)),
+            None => resp.error(404, &format!("no such sandbox: {id}")),
+        },
+        ("GET", ["v1", "sandboxes", id, "procs"]) => resp.json(200, &state.procs.list(Some(id))),
+        ("GET", ["v1", "sandboxes", id, "procs", pid, "logs"]) => match parse_owned_pid(state, id, pid) {
+            Ok(_) => exec::handle_logs(state, pid, &request.params, resp),
+            Err(()) => resp.error(404, &format!("no such process: {pid}")),
+        },
+        ("GET", ["v1", "sandboxes", id, "procs", pid, "wait"]) => match parse_owned_pid(state, id, pid) {
+            Ok(_) => exec::handle_wait(state, pid, resp),
+            Err(()) => resp.error(404, &format!("no such process: {pid}")),
+        },
+        ("POST", ["v1", "sandboxes", id, "procs", pid, "kill"]) => match parse_owned_pid(state, id, pid) {
+            Ok(pid) => exec::handle_kill(state, request, reader, &pid, resp),
+            Err(()) => resp.error(404, &format!("no such process: {pid}")),
+        },
+        ("POST", ["v1", "sandboxes", id, "procs", pid, "stdin"]) => match parse_owned_pid(state, id, pid) {
+            Ok(pid) => exec::handle_stdin(state, request, reader, &pid, resp),
+            Err(()) => resp.error(404, &format!("no such process: {pid}")),
+        },
+        ("GET", ["v1", "sandboxes", id, "files", "read"]) => with_sandbox(state, id, resp, |e, r| files::handle_read(request, r, Some(&e))),
+        ("PUT", ["v1", "sandboxes", id, "files", "write"]) => with_sandbox(state, id, resp, |e, r| files::handle_write(request, reader, r, Some(&e))),
+        ("GET", ["v1", "sandboxes", id, "files", "list"]) => with_sandbox(state, id, resp, |e, r| files::handle_list(request, r, Some(&e))),
+        ("GET", ["v1", "sandboxes", id, "files", "stat"]) => with_sandbox(state, id, resp, |e, r| files::handle_stat(request, r, Some(&e))),
+        ("DELETE", ["v1", "sandboxes", id, "files", "delete"]) => with_sandbox(state, id, resp, |e, r| files::handle_delete(request, r, Some(&e))),
+        ("POST", ["v1", "sandboxes", id, "files", "mkdir"]) => with_sandbox(state, id, resp, |e, r| files::handle_mkdir(request, r, Some(&e))),
+
         _ => resp.error(404, &format!("no route: {method} {path}")),
+    }
+}
+
+/// Look up a sandbox and run `f` with its entry, or reply 404 if it doesn't exist.
+fn with_sandbox(
+    state: &Arc<State>,
+    id: &str,
+    resp: &mut ResponseWriter,
+    f: impl FnOnce(Arc<sandboxes::SandboxEntry>, &mut ResponseWriter) -> std::io::Result<()>,
+) -> std::io::Result<()> {
+    match state.sandboxes.get(id) {
+        Some(entry) => f(entry, resp),
+        None => resp.error(404, &format!("no such sandbox: {id}")),
+    }
+}
+
+/// Parse `pid` and confirm it belongs to sandbox `id` (host-mode process scoping).
+fn parse_owned_pid(state: &Arc<State>, id: &str, pid: &str) -> Result<String, ()> {
+    match pid.parse::<u32>() {
+        Ok(p) if state.procs.belongs(p, id) => Ok(pid.to_string()),
+        _ => Err(()),
     }
 }
 

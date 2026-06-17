@@ -9,9 +9,12 @@
 //! (the Docker default set on HF Jobs).
 
 use std::collections::HashMap;
+use std::ffi::CString;
 use std::io::{BufReader, Read};
 use std::net::TcpStream;
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::PermissionsExt;
+use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -219,6 +222,60 @@ pub fn base_env(entry: &SandboxEntry) -> Vec<(String, String)> {
 }
 
 // ---------------------------------------------------------------------------
+// Per-sandbox filesystem helpers
+// ---------------------------------------------------------------------------
+
+/// Resolve a user-facing path to an absolute path confined to the sandbox home.
+///
+/// In host mode a sandbox's writable view is its home (Landlock confines the
+/// running code to it), so the file API roots every path at the home: a path is
+/// taken relative to the home (a leading `/` is ignored) and `..` components can
+/// never climb above it. This gives the caller a clean "filesystem rooted at the
+/// sandbox" model that matches what code running inside the sandbox can touch.
+pub fn resolve_in_home(home: &str, path: &str) -> PathBuf {
+    let mut stack: Vec<std::ffi::OsString> = Vec::new();
+    for comp in Path::new(path).components() {
+        match comp {
+            Component::Normal(c) => stack.push(c.to_os_string()),
+            Component::ParentDir => {
+                stack.pop();
+            }
+            // RootDir / CurDir / Prefix are dropped: everything is relative to home.
+            _ => {}
+        }
+    }
+    let mut result = PathBuf::from(home);
+    for c in stack {
+        result.push(c);
+    }
+    result
+}
+
+fn chown(path: &Path, uid: u32) {
+    if let Ok(c) = CString::new(path.as_os_str().as_bytes()) {
+        unsafe {
+            libc::chown(c.as_ptr(), uid, uid);
+        }
+    }
+}
+
+/// Chown `target` and every ancestor up to (but excluding) `home` to `uid`, so
+/// files placed through the API are owned by the sandbox and readable/writable
+/// by its code (which runs as `uid`). Anything created as root would otherwise
+/// be inaccessible to the sandbox.
+pub fn chown_into_home(home: &str, target: &Path, uid: u32) {
+    let home_path = Path::new(home);
+    let mut cur = Some(target);
+    while let Some(p) = cur {
+        if p == home_path || !p.starts_with(home_path) {
+            break;
+        }
+        chown(p, uid);
+        cur = p.parent();
+    }
+}
+
+// ---------------------------------------------------------------------------
 // HTTP handlers
 // ---------------------------------------------------------------------------
 
@@ -252,6 +309,7 @@ pub fn handle_create(
 
 pub fn handle_delete(state: &Arc<State>, id: &str, resp: &mut ResponseWriter) -> std::io::Result<()> {
     if state.sandboxes.delete(id) {
+        state.procs.remove_for_sandbox(id);
         resp.json(200, &serde_json::json!({"id": id, "deleted": true}))
     } else {
         resp.error(404, &format!("no such sandbox: {id}"))
@@ -264,6 +322,7 @@ pub fn handle_delete_all(state: &Arc<State>, resp: &mut ResponseWriter) -> std::
     let n = ids.len();
     for id in ids {
         state.sandboxes.delete(&id);
+        state.procs.remove_for_sandbox(&id);
     }
     resp.json(200, &serde_json::json!({"deleted": n}))
 }

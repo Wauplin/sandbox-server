@@ -3,10 +3,26 @@
 The in-sandbox agent powering `hf sandbox` / `huggingface_hub.Sandbox` — isolated cloud
 machines built on [Hugging Face Jobs](https://huggingface.co/docs/huggingface_hub/guides/jobs).
 
-A single static binary (~641KB, x86_64 musl, zero runtime dependencies) that runs in **any**
+A single static binary (~671KB, x86_64 musl, zero runtime dependencies) that runs in **any**
 Docker image with `/bin/sh` — no Python, pip, or framework required. The `Sandbox` client
 injects it at job startup and talks to it through the Jobs proxy
 (`https://<job_id>--<port>.hf.jobs`).
+
+## Two modes (one binary)
+
+The same binary serves both:
+
+- **Dedicated mode** — one job *is* one sandbox. Operations hit `/v1/exec`, `/v1/files/*`,
+  `/v1/procs/*` directly. Full VM isolation; used for GPU / untrusted workloads.
+- **Host mode** — one job hosts *many* lightweight sandboxes (`huggingface_hub.SandboxPool`).
+  A sandbox is a dedicated uid + a private `0700` home + a per-sandbox **Landlock LSM**
+  ruleset, created server-side in ~1ms. Operations are scoped under `/v1/sandboxes/{id}/*`
+  and run as the sandbox uid, confined to its home. This packs dozens of isolated CPU
+  sandboxes into one VM with sub-second per-sandbox cold start.
+
+Host mode needs root + `CAP_SETUID/SETGID/KILL` (the Docker default on HF Jobs) and degrades
+to uid-only isolation if Landlock is unavailable. See `src/landlock.rs` for the confinement
+model (FS → own home + RO system dirs; no TCP bind; ABI-6 abstract-socket scoping).
 
 ## What it does
 
@@ -38,9 +54,20 @@ PUT  /v1/files/write?path=&mode=&offset=  → raw body to file (parents created)
 GET  /v1/files/list?path=  /stat?path=
 DELETE /v1/files/delete?path=&recursive=
 POST /v1/files/mkdir?path=
+
+# host mode (many sandboxes per job)
+POST   /v1/sandboxes        {count?, env?, max_procs?, max_mem_mb?}  → {"sandboxes":[{id,uid,home}]}
+GET    /v1/sandboxes                                                 → live sandbox list
+DELETE /v1/sandboxes                                                 → delete all
+DELETE /v1/sandboxes/{id}                                            → delete one (frees the uid)
+# every dedicated route above also exists scoped to a sandbox, e.g.:
+POST   /v1/sandboxes/{id}/exec        ...   GET /v1/sandboxes/{id}/procs
+GET    /v1/sandboxes/{id}/files/read  ...   PUT /v1/sandboxes/{id}/files/write
 ```
 
-`cmd` is either a string (run via `/bin/sh -c`) or an argv array.
+`cmd` is either a string (run via `/bin/sh -c`) or an argv array. In host mode, file paths
+are rooted at the sandbox's private home (a leading `/` is taken relative to it) and created
+files are `chown`ed to the sandbox uid.
 
 ## Configuration (env vars)
 

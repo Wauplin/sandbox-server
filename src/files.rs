@@ -8,19 +8,36 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 
 use crate::http::{stream_body, Request, ResponseWriter};
+use crate::sandboxes::SandboxEntry;
 
-fn require_path<'a>(request: &'a Request, resp: &mut ResponseWriter) -> Result<&'a str, std::io::Result<()>> {
-    match request.params.get("path").map(|s| s.as_str()) {
-        Some(p) if !p.is_empty() => Ok(p),
-        _ => Err(resp.error(400, "missing 'path' query parameter")),
+/// Resolve the request's `path` parameter to the absolute filesystem path to act
+/// on. In dedicated mode (`sandbox = None`) the path is used as-is; in host mode
+/// it is rooted at the sandbox home (see `sandboxes::resolve_in_home`).
+fn require_path(
+    request: &Request,
+    resp: &mut ResponseWriter,
+    sandbox: Option<&SandboxEntry>,
+) -> Result<String, std::io::Result<()>> {
+    let raw = match request.params.get("path").map(|s| s.as_str()) {
+        Some(p) if !p.is_empty() => p,
+        _ => return Err(resp.error(400, "missing 'path' query parameter")),
+    };
+    match sandbox {
+        None => Ok(raw.to_string()),
+        Some(sbx) => Ok(crate::sandboxes::resolve_in_home(&sbx.home, raw).to_string_lossy().into_owned()),
     }
 }
 
-pub fn handle_read(request: &mut Request, resp: &mut ResponseWriter) -> std::io::Result<()> {
-    let path = match require_path(request, resp) {
+pub fn handle_read(
+    request: &mut Request,
+    resp: &mut ResponseWriter,
+    sandbox: Option<&SandboxEntry>,
+) -> std::io::Result<()> {
+    let path = match require_path(request, resp, sandbox) {
         Ok(p) => p,
         Err(r) => return r,
     };
+    let path = path.as_str();
     let mut file = match fs::File::open(path) {
         Ok(f) => f,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
@@ -63,9 +80,10 @@ pub fn handle_write(
     request: &mut Request,
     reader: &mut BufReader<TcpStream>,
     resp: &mut ResponseWriter,
+    sandbox: Option<&SandboxEntry>,
 ) -> std::io::Result<()> {
-    let path = match require_path(request, resp) {
-        Ok(p) => p.to_string(),
+    let path = match require_path(request, resp, sandbox) {
+        Ok(p) => p,
         Err(r) => return r,
     };
     let mkdir = request.params.get("mkdir").map(|v| v != "false" && v != "0").unwrap_or(true);
@@ -102,6 +120,9 @@ pub fn handle_write(
     if let Some(mode) = mode {
         let _ = fs::set_permissions(&path, fs::Permissions::from_mode(mode));
     }
+    if let Some(sbx) = sandbox {
+        crate::sandboxes::chown_into_home(&sbx.home, Path::new(&path), sbx.uid);
+    }
     resp.json(200, &serde_json::json!({"path": path, "size": size}))
 }
 
@@ -128,11 +149,16 @@ fn entry_json(path: &Path, metadata: &fs::Metadata) -> serde_json::Value {
     })
 }
 
-pub fn handle_list(request: &mut Request, resp: &mut ResponseWriter) -> std::io::Result<()> {
-    let path = match require_path(request, resp) {
+pub fn handle_list(
+    request: &mut Request,
+    resp: &mut ResponseWriter,
+    sandbox: Option<&SandboxEntry>,
+) -> std::io::Result<()> {
+    let path = match require_path(request, resp, sandbox) {
         Ok(p) => p,
         Err(r) => return r,
     };
+    let path = path.as_str();
     let entries = match fs::read_dir(path) {
         Ok(entries) => entries,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
@@ -150,11 +176,16 @@ pub fn handle_list(request: &mut Request, resp: &mut ResponseWriter) -> std::io:
     resp.json(200, &serde_json::json!({"entries": items}))
 }
 
-pub fn handle_stat(request: &mut Request, resp: &mut ResponseWriter) -> std::io::Result<()> {
-    let path = match require_path(request, resp) {
+pub fn handle_stat(
+    request: &mut Request,
+    resp: &mut ResponseWriter,
+    sandbox: Option<&SandboxEntry>,
+) -> std::io::Result<()> {
+    let path = match require_path(request, resp, sandbox) {
         Ok(p) => p,
         Err(r) => return r,
     };
+    let path = path.as_str();
     match fs::symlink_metadata(path) {
         Ok(metadata) => resp.json(200, &entry_json(Path::new(path), &metadata)),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => resp.error(404, &format!("no such path: {path}")),
@@ -162,11 +193,16 @@ pub fn handle_stat(request: &mut Request, resp: &mut ResponseWriter) -> std::io:
     }
 }
 
-pub fn handle_delete(request: &mut Request, resp: &mut ResponseWriter) -> std::io::Result<()> {
-    let path = match require_path(request, resp) {
+pub fn handle_delete(
+    request: &mut Request,
+    resp: &mut ResponseWriter,
+    sandbox: Option<&SandboxEntry>,
+) -> std::io::Result<()> {
+    let path = match require_path(request, resp, sandbox) {
         Ok(p) => p,
         Err(r) => return r,
     };
+    let path = path.as_str();
     let recursive = request.params.get("recursive").map(|v| v == "true" || v == "1").unwrap_or(false);
     let metadata = match fs::symlink_metadata(path) {
         Ok(m) => m,
@@ -190,13 +226,23 @@ pub fn handle_delete(request: &mut Request, resp: &mut ResponseWriter) -> std::i
     }
 }
 
-pub fn handle_mkdir(request: &mut Request, resp: &mut ResponseWriter) -> std::io::Result<()> {
-    let path = match require_path(request, resp) {
+pub fn handle_mkdir(
+    request: &mut Request,
+    resp: &mut ResponseWriter,
+    sandbox: Option<&SandboxEntry>,
+) -> std::io::Result<()> {
+    let path = match require_path(request, resp, sandbox) {
         Ok(p) => p,
         Err(r) => return r,
     };
+    let path = path.as_str();
     match fs::create_dir_all(path) {
-        Ok(()) => resp.json(200, &serde_json::json!({"created": path})),
+        Ok(()) => {
+            if let Some(sbx) = sandbox {
+                crate::sandboxes::chown_into_home(&sbx.home, Path::new(path), sbx.uid);
+            }
+            resp.json(200, &serde_json::json!({"created": path}))
+        }
         Err(e) => resp.error(400, &format!("cannot mkdir {path}: {e}")),
     }
 }

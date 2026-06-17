@@ -236,6 +236,8 @@ pub struct Proc {
     pub tag: Option<String>,
     pub display: String,
     pub started_at_ms: i64,
+    /// Owning sandbox id in host mode (None for dedicated-mode processes).
+    pub sandbox_id: Option<String>,
     pub state: Mutex<ProcState>,
     pub exited: Condvar,
     pub stdin: Mutex<Option<ChildStdin>>,
@@ -255,6 +257,21 @@ impl ProcRegistry {
         self.procs.lock().unwrap().iter().find(|p| p.pid == pid).cloned()
     }
 
+    /// Whether `pid` exists and belongs to `sandbox_id` (host-mode scoping).
+    pub fn belongs(&self, pid: u32, sandbox_id: &str) -> bool {
+        self.procs
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|p| p.pid == pid && p.sandbox_id.as_deref() == Some(sandbox_id))
+    }
+
+    /// Forget all processes owned by a sandbox (called when it is deleted) so the
+    /// registry doesn't grow without bound across short-lived sandboxes.
+    pub fn remove_for_sandbox(&self, sandbox_id: &str) {
+        self.procs.lock().unwrap().retain(|p| p.sandbox_id.as_deref() != Some(sandbox_id));
+    }
+
     pub fn running_count(&self) -> usize {
         self.procs
             .lock()
@@ -264,11 +281,14 @@ impl ProcRegistry {
             .count()
     }
 
-    pub fn list(&self) -> serde_json::Value {
+    /// List processes. In host mode pass `Some(sandbox_id)` to list only that
+    /// sandbox's processes; pass `None` for the dedicated-mode global list.
+    pub fn list(&self, sandbox_id: Option<&str>) -> serde_json::Value {
         let procs = self.procs.lock().unwrap();
         serde_json::Value::Array(
             procs
                 .iter()
+                .filter(|p| sandbox_id.is_none() || p.sandbox_id.as_deref() == sandbox_id)
                 .map(|p| {
                     let state = p.state.lock().unwrap();
                     serde_json::json!({
@@ -370,6 +390,7 @@ pub fn handle_exec(
             tag: spec.tag.clone(),
             display: spec.display.clone(),
             started_at_ms: started_at,
+            sandbox_id: spec.sandbox.as_ref().map(|s| s.id.clone()),
             state: Mutex::new(ProcState {
                 events: Default::default(),
                 buffered_bytes: 0,
