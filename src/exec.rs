@@ -76,11 +76,15 @@ pub struct ExecSpec {
 
 impl ExecSpec {
     pub fn from_json(body: &serde_json::Value) -> Result<Self, String> {
-        let (argv, display) = match body.get("cmd") {
-            Some(serde_json::Value::String(s)) => {
+        // `shell` makes the shell-vs-argv choice explicit; when omitted it is inferred
+        // from the type of `cmd` (string → shell, array → argv) for backward compatibility.
+        // When set, it is authoritative and the type of `cmd` must match it.
+        let shell = body.get("shell").and_then(|v| v.as_bool());
+        let (argv, display) = match (shell, body.get("cmd")) {
+            (Some(true) | None, Some(serde_json::Value::String(s))) => {
                 (vec!["/bin/sh".to_string(), "-c".to_string(), s.clone()], s.clone())
             }
-            Some(serde_json::Value::Array(items)) => {
+            (Some(false) | None, Some(serde_json::Value::Array(items))) => {
                 let argv: Vec<String> = items
                     .iter()
                     .map(|v| v.as_str().map(String::from).ok_or("cmd array items must be strings"))
@@ -91,7 +95,9 @@ impl ExecSpec {
                 let display = argv.join(" ");
                 (argv, display)
             }
-            _ => return Err("missing 'cmd' (string or array of strings)".into()),
+            (Some(true), _) => return Err("shell=true requires 'cmd' to be a string".into()),
+            (Some(false), _) => return Err("shell=false requires 'cmd' to be an array of strings".into()),
+            (None, _) => return Err("missing 'cmd' (string or array of strings)".into()),
         };
         let env = body
             .get("env")

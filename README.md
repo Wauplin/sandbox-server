@@ -41,7 +41,7 @@ model (FS → own home + RO system dirs; no TCP bind; ABI-6 abstract-socket scop
 
 ```
 GET  /health                              → {"status","version","uptime_ms"}   (no auth)
-POST /v1/exec        {cmd, env?, cwd?, timeout?, stdin?, background?, tag?}
+POST /v1/exec        {cmd, shell?, env?, cwd?, timeout?, stdin?, background?, tag?}
                      foreground → NDJSON stream: start / stdout / stderr / ping / exit
                      background → {"pid", "tag"}
 GET  /v1/procs                            → process list
@@ -65,7 +65,9 @@ POST   /v1/sandboxes/{id}/exec        ...   GET /v1/sandboxes/{id}/procs
 GET    /v1/sandboxes/{id}/files/read  ...   PUT /v1/sandboxes/{id}/files/write
 ```
 
-`cmd` is either a string (run via `/bin/sh -c`) or an argv array. In host mode, file paths
+`cmd` is either a string (run via `/bin/sh -c`) or an argv array. Pass `shell` (bool) to make
+that choice explicit instead of inferring it from the type: `shell=true` requires a string,
+`shell=false` requires an argv array. In host mode, file paths
 are rooted at the sandbox's private home (a leading `/` is taken relative to it) and created
 files are `chown`ed to the sandbox uid.
 
