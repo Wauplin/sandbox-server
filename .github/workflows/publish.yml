@@ -47,12 +47,12 @@ jobs:
 
       - name: Upload commit-labelled binary
         run: |
-          hf cp \
+          HF_DEBUG=1 hf cp \
             "target/$TARGET/release/sbx-server" \
             "$BUCKET/sbx-server-${{ steps.vars.outputs.commit }}"
 
       - name: Update default binary (server-side copy)
         run: |
-          hf cp \
+          HF_DEBUG=1 hf cp \
             "$BUCKET/sbx-server-${{ steps.vars.outputs.commit }}" \
             "$BUCKET/sbx-server"
