@@ -17,15 +17,18 @@ fn require_path(
     request: &Request,
     resp: &mut ResponseWriter,
     sandbox: Option<&SandboxEntry>,
-) -> Result<String, std::io::Result<()>> {
+) -> std::io::Result<Option<String>> {
     let raw = match request.params.get("path").map(|s| s.as_str()) {
         Some(p) if !p.is_empty() => p,
-        _ => return Err(resp.error(400, "missing 'path' query parameter")),
+        _ => {
+            resp.error(400, "missing 'path' query parameter")?;
+            return Ok(None);
+        }
     };
-    match sandbox {
-        None => Ok(raw.to_string()),
-        Some(sbx) => Ok(crate::sandboxes::resolve_in_home(&sbx.home, raw).to_string_lossy().into_owned()),
-    }
+    Ok(Some(match sandbox {
+        None => raw.to_string(),
+        Some(sbx) => crate::sandboxes::resolve_in_home(&sbx.home, raw).to_string_lossy().into_owned(),
+    }))
 }
 
 pub fn handle_read(
@@ -33,10 +36,7 @@ pub fn handle_read(
     resp: &mut ResponseWriter,
     sandbox: Option<&SandboxEntry>,
 ) -> std::io::Result<()> {
-    let path = match require_path(request, resp, sandbox) {
-        Ok(p) => p,
-        Err(r) => return r,
-    };
+    let Some(path) = require_path(request, resp, sandbox)? else { return Ok(()) };
     let path = path.as_str();
     let mut file = match fs::File::open(path) {
         Ok(f) => f,
@@ -82,11 +82,8 @@ pub fn handle_write(
     resp: &mut ResponseWriter,
     sandbox: Option<&SandboxEntry>,
 ) -> std::io::Result<()> {
-    let path = match require_path(request, resp, sandbox) {
-        Ok(p) => p,
-        Err(r) => return r,
-    };
-    let mkdir = request.params.get("mkdir").map(|v| v != "false" && v != "0").unwrap_or(true);
+    let Some(path) = require_path(request, resp, sandbox)? else { return Ok(()) };
+    let mkdir = crate::http::bool_param(&request.params, "mkdir", true);
     let mode = request.params.get("mode").and_then(|m| u32::from_str_radix(m, 8).ok());
 
     if mkdir {
@@ -154,10 +151,7 @@ pub fn handle_list(
     resp: &mut ResponseWriter,
     sandbox: Option<&SandboxEntry>,
 ) -> std::io::Result<()> {
-    let path = match require_path(request, resp, sandbox) {
-        Ok(p) => p,
-        Err(r) => return r,
-    };
+    let Some(path) = require_path(request, resp, sandbox)? else { return Ok(()) };
     let path = path.as_str();
     let entries = match fs::read_dir(path) {
         Ok(entries) => entries,
@@ -181,10 +175,7 @@ pub fn handle_stat(
     resp: &mut ResponseWriter,
     sandbox: Option<&SandboxEntry>,
 ) -> std::io::Result<()> {
-    let path = match require_path(request, resp, sandbox) {
-        Ok(p) => p,
-        Err(r) => return r,
-    };
+    let Some(path) = require_path(request, resp, sandbox)? else { return Ok(()) };
     let path = path.as_str();
     match fs::symlink_metadata(path) {
         Ok(metadata) => resp.json(200, &entry_json(Path::new(path), &metadata)),
@@ -198,12 +189,9 @@ pub fn handle_delete(
     resp: &mut ResponseWriter,
     sandbox: Option<&SandboxEntry>,
 ) -> std::io::Result<()> {
-    let path = match require_path(request, resp, sandbox) {
-        Ok(p) => p,
-        Err(r) => return r,
-    };
+    let Some(path) = require_path(request, resp, sandbox)? else { return Ok(()) };
     let path = path.as_str();
-    let recursive = request.params.get("recursive").map(|v| v == "true" || v == "1").unwrap_or(false);
+    let recursive = crate::http::bool_param(&request.params, "recursive", false);
     let metadata = match fs::symlink_metadata(path) {
         Ok(m) => m,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
@@ -231,10 +219,7 @@ pub fn handle_mkdir(
     resp: &mut ResponseWriter,
     sandbox: Option<&SandboxEntry>,
 ) -> std::io::Result<()> {
-    let path = match require_path(request, resp, sandbox) {
-        Ok(p) => p,
-        Err(r) => return r,
-    };
+    let Some(path) = require_path(request, resp, sandbox)? else { return Ok(()) };
     let path = path.as_str();
     match fs::create_dir_all(path) {
         Ok(()) => {

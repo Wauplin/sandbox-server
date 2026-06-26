@@ -4,6 +4,7 @@ mod http;
 mod landlock;
 mod sandboxes;
 
+use std::collections::HashMap;
 use std::io::{BufReader, BufWriter};
 use std::net::{TcpListener, TcpStream};
 use std::sync::atomic::{AtomicI64, Ordering};
@@ -16,6 +17,16 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 pub fn now_ms() -> i64 {
     SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as i64
+}
+
+/// Parse `value[key]` (a JSON object of string→string) into a map. Non-string
+/// values become empty strings; a missing or non-object key yields an empty map.
+pub fn json_string_map(value: &serde_json::Value, key: &str) -> HashMap<String, String> {
+    value
+        .get(key)
+        .and_then(|v| v.as_object())
+        .map(|m| m.iter().map(|(k, v)| (k.clone(), v.as_str().unwrap_or_default().to_string())).collect())
+        .unwrap_or_default()
 }
 
 pub struct State {
@@ -227,13 +238,11 @@ fn main() {
                         }
                     }
                     // 2. Shut the host down once it's been empty for the host idle timeout.
-                    if state.sandboxes.count() == 0 {
-                        if now - empty_since > idle_ms {
-                            eprintln!("sbx-server: host empty for {}ms, shutting down", now - empty_since);
-                            std::process::exit(0);
-                        }
-                    } else {
+                    if state.sandboxes.count() != 0 {
                         empty_since = now;
+                    } else if now - empty_since > idle_ms {
+                        eprintln!("sbx-server: host empty for {}ms, shutting down", now - empty_since);
+                        std::process::exit(0);
                     }
                 } else {
                     // Dedicated: the whole job is the sandbox — stop when quiet and idle.

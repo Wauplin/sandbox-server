@@ -26,6 +26,16 @@ impl Request {
     }
 }
 
+/// Parse a truthy query parameter: "true"/"1" → true, "false"/"0" → false,
+/// anything else (or absent) → `default`.
+pub fn bool_param(params: &HashMap<String, String>, key: &str, default: bool) -> bool {
+    match params.get(key).map(|v| v.as_str()) {
+        Some("true" | "1") => true,
+        Some("false" | "0") => false,
+        _ => default,
+    }
+}
+
 /// Reads the request head from `reader`. Returns Ok(None) on clean EOF (client
 /// closed a keep-alive connection between requests).
 pub fn read_request(reader: &mut BufReader<TcpStream>) -> io::Result<Option<Request>> {

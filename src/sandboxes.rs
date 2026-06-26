@@ -355,11 +355,7 @@ pub fn handle_create(
     let json: serde_json::Value =
         if body.is_empty() { serde_json::json!({}) } else { serde_json::from_slice(&body).unwrap_or(serde_json::json!({})) };
     let count = json.get("count").and_then(|v| v.as_u64()).unwrap_or(1).clamp(1, 4096) as usize;
-    let env: HashMap<String, String> = json
-        .get("env")
-        .and_then(|v| v.as_object())
-        .map(|m| m.iter().map(|(k, v)| (k.clone(), v.as_str().unwrap_or_default().to_string())).collect())
-        .unwrap_or_default();
+    let env: HashMap<String, String> = crate::json_string_map(&json, "env");
     let max_procs = json.get("max_procs").and_then(|v| v.as_u64());
     let max_mem_mb = json.get("max_mem_mb").and_then(|v| v.as_u64());
     // Per-sandbox idle timeout (the host has its own, for when it's empty). 0 = never.
