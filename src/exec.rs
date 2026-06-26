@@ -16,6 +16,8 @@ use crate::{now_ms, State};
 
 /// Heartbeat interval for long-silent streams, to keep the proxy connection alive.
 const PING_INTERVAL: Duration = Duration::from_secs(15);
+/// Keepalive frame written on stream timeout (kept identical across all streams).
+const PING_CHUNK: &[u8] = b"{\"event\":\"ping\"}\n";
 /// Per-process buffered log budget for background processes.
 const LOG_BUFFER_BYTES: usize = 4 * 1024 * 1024;
 
@@ -36,20 +38,20 @@ pub struct ExitInfo {
 
 impl Event {
     fn to_line(&self) -> String {
-        match self {
-            Event::Stdout(d) => format!("{}\n", serde_json::json!({"event": "stdout", "data": d})),
-            Event::Stderr(d) => format!("{}\n", serde_json::json!({"event": "stderr", "data": d})),
-            Event::Exit(info) => format!(
-                "{}\n",
-                serde_json::json!({
-                    "event": "exit",
-                    "exit_code": info.exit_code,
-                    "signal": info.signal,
-                    "timed_out": info.timed_out,
-                    "duration_ms": info.duration_ms,
-                })
-            ),
-        }
+        let mut line = match self {
+            Event::Stdout(d) => serde_json::json!({"event": "stdout", "data": d}).to_string(),
+            Event::Stderr(d) => serde_json::json!({"event": "stderr", "data": d}).to_string(),
+            Event::Exit(info) => serde_json::json!({
+                "event": "exit",
+                "exit_code": info.exit_code,
+                "signal": info.signal,
+                "timed_out": info.timed_out,
+                "duration_ms": info.duration_ms,
+            })
+            .to_string(),
+        };
+        line.push('\n');
+        line
     }
 
     fn byte_len(&self) -> usize {
@@ -99,19 +101,10 @@ impl ExecSpec {
             (Some(false), _) => return Err("shell=false requires 'cmd' to be an array of strings".into()),
             (None, _) => return Err("missing 'cmd' (string or array of strings)".into()),
         };
-        let env = body
-            .get("env")
-            .and_then(|v| v.as_object())
-            .map(|m| {
-                m.iter()
-                    .map(|(k, v)| (k.clone(), v.as_str().unwrap_or_default().to_string()))
-                    .collect()
-            })
-            .unwrap_or_default();
         Ok(ExecSpec {
             argv,
             display,
-            env,
+            env: crate::json_string_map(body, "env"),
             cwd: body.get("cwd").and_then(|v| v.as_str()).map(String::from),
             timeout_secs: body.get("timeout").and_then(|v| v.as_f64()),
             stdin: body.get("stdin").and_then(|v| v.as_str()).map(String::from),
@@ -356,6 +349,22 @@ fn pump_background(proc: Arc<Proc>, rx: Receiver<Event>) {
 // HTTP handlers
 // ---------------------------------------------------------------------------
 
+/// Look up a process by its (string) pid, replying 404 if it doesn't exist.
+/// `Ok(None)` means the 404 was already written and the caller should return.
+fn require_proc(
+    state: &Arc<State>,
+    pid: &str,
+    resp: &mut ResponseWriter,
+) -> std::io::Result<Option<Arc<Proc>>> {
+    match pid.parse().ok().and_then(|pid| state.procs.get(pid)) {
+        Some(proc) => Ok(Some(proc)),
+        None => {
+            resp.error(404, &format!("no such process: {pid}"))?;
+            Ok(None)
+        }
+    }
+}
+
 /// Streams events from `rx` as NDJSON chunks until Exit, with keepalive pings.
 fn stream_events(rx: &Receiver<Event>, resp: &mut ResponseWriter) -> std::io::Result<()> {
     loop {
@@ -368,7 +377,7 @@ fn stream_events(rx: &Receiver<Event>, resp: &mut ResponseWriter) -> std::io::Re
                 }
             }
             Err(RecvTimeoutError::Timeout) => {
-                resp.chunk(b"{\"event\":\"ping\"}\n")?;
+                resp.chunk(PING_CHUNK)?;
             }
             Err(RecvTimeoutError::Disconnected) => return Ok(()),
         }
@@ -441,16 +450,14 @@ pub fn handle_logs(
     params: &HashMap<String, String>,
     resp: &mut ResponseWriter,
 ) -> std::io::Result<()> {
-    let Some(proc) = pid.parse().ok().and_then(|pid| state.procs.get(pid)) else {
-        return resp.error(404, &format!("no such process: {pid}"));
-    };
-    let follow = params.get("follow").map(|v| v == "true" || v == "1").unwrap_or(false);
+    let Some(proc) = require_proc(state, pid, resp)? else { return Ok(()) };
+    let follow = crate::http::bool_param(params, "follow", false);
 
     resp.start_stream(200, "application/x-ndjson")?;
 
     // Snapshot buffered events and (if following) subscribe atomically, so no
     // event is missed or duplicated between replay and live streaming.
-    let (snapshot, rx, exited) = {
+    let (snapshot, rx) = {
         let mut proc_state = proc.state.lock().unwrap();
         let snapshot: Vec<Event> = proc_state.events.iter().cloned().collect();
         let exited = proc_state.exit.is_some();
@@ -461,24 +468,22 @@ pub fn handle_logs(
         } else {
             None
         };
-        (snapshot, rx, exited)
+        (snapshot, rx)
     };
 
     for event in &snapshot {
         resp.chunk(event.to_line().as_bytes())?;
     }
+    // If the proc exited between lookup and subscribe, `rx` is None and the
+    // snapshot above already carried the Exit event — nothing left to stream.
     if let Some(rx) = rx {
         stream_events(&rx, resp)?;
-    } else if !exited && follow {
-        // raced: proc exited between lookup and subscribe — snapshot already has Exit
     }
     Ok(())
 }
 
 pub fn handle_wait(state: &Arc<State>, pid: &str, resp: &mut ResponseWriter) -> std::io::Result<()> {
-    let Some(proc) = pid.parse().ok().and_then(|pid| state.procs.get(pid)) else {
-        return resp.error(404, &format!("no such process: {pid}"));
-    };
+    let Some(proc) = require_proc(state, pid, resp)? else { return Ok(()) };
     resp.start_stream(200, "application/x-ndjson")?;
     let mut guard = proc.state.lock().unwrap();
     loop {
@@ -506,9 +511,7 @@ pub fn handle_kill(
 ) -> std::io::Result<()> {
     let body = read_body(request, reader, 1024 * 1024)?;
     let json: serde_json::Value = serde_json::from_slice(&body).unwrap_or(serde_json::json!({}));
-    let Some(proc) = pid.parse().ok().and_then(|pid| state.procs.get(pid)) else {
-        return resp.error(404, &format!("no such process: {pid}"));
-    };
+    let Some(proc) = require_proc(state, pid, resp)? else { return Ok(()) };
     let signal = match json.get("signal") {
         Some(serde_json::Value::String(s)) => match s.to_uppercase().as_str() {
             "TERM" | "SIGTERM" => libc::SIGTERM,
@@ -531,10 +534,8 @@ pub fn handle_stdin(
     pid: &str,
     resp: &mut ResponseWriter,
 ) -> std::io::Result<()> {
-    let Some(proc) = pid.parse().ok().and_then(|pid| state.procs.get(pid)) else {
-        return resp.error(404, &format!("no such process: {pid}"));
-    };
-    let eof = request.params.get("eof").map(|v| v == "true" || v == "1").unwrap_or(false);
+    let Some(proc) = require_proc(state, pid, resp)? else { return Ok(()) };
+    let eof = crate::http::bool_param(&request.params, "eof", false);
     let mut stdin_guard = proc.stdin.lock().unwrap();
     let Some(stdin) = stdin_guard.as_mut() else {
         return resp.error(409, "stdin not available for this process");
