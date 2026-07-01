@@ -65,6 +65,9 @@ impl Event {
 pub struct ExecSpec {
     pub argv: Vec<String>,
     pub display: String,
+    /// The original `cmd` value verbatim (string or argv array), preserved so the
+    /// `/processes` API can round-trip it back to the client unchanged.
+    pub cmd_json: serde_json::Value,
     pub env: HashMap<String, String>,
     pub cwd: Option<String>,
     pub timeout_secs: Option<f64>,
@@ -104,6 +107,7 @@ impl ExecSpec {
         Ok(ExecSpec {
             argv,
             display,
+            cmd_json: body.get("cmd").cloned().unwrap_or(serde_json::Value::Null),
             env: crate::json_string_map(body, "env"),
             cwd: body.get("cwd").and_then(|v| v.as_str()).map(String::from),
             timeout_secs: body.get("timeout").and_then(|v| v.as_f64()),
@@ -231,9 +235,14 @@ pub struct ProcState {
 }
 
 pub struct Proc {
+    /// Opaque, server-assigned handle (e.g. `p-3`) — the stable id the `/processes`
+    /// API exposes, distinct from the OS `pid` (which the OS may later reuse).
+    pub id: String,
     pub pid: u32,
     pub tag: Option<String>,
     pub display: String,
+    /// Original `cmd` value (string or argv array), echoed back by `/processes`.
+    pub cmd_json: serde_json::Value,
     pub started_at_ms: i64,
     /// Owning sandbox id in host mode (None for dedicated-mode processes).
     pub sandbox_id: Option<String>,
@@ -245,6 +254,8 @@ pub struct Proc {
 #[derive(Default)]
 pub struct ProcRegistry {
     procs: Mutex<Vec<Arc<Proc>>>,
+    /// Monotonic source for opaque process ids.
+    seq: std::sync::atomic::AtomicU64,
 }
 
 impl ProcRegistry {
@@ -252,8 +263,25 @@ impl ProcRegistry {
         self.procs.lock().unwrap().push(proc);
     }
 
+    /// Allocate a fresh opaque process id (e.g. `p-7`).
+    pub fn alloc_id(&self) -> String {
+        let n = self.seq.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        format!("p-{n}")
+    }
+
     pub fn get(&self, pid: u32) -> Option<Arc<Proc>> {
         self.procs.lock().unwrap().iter().find(|p| p.pid == pid).cloned()
+    }
+
+    /// Remove the process with opaque `id` (optionally scoped to `sandbox_id` in host
+    /// mode) and return it so the caller can signal it. `None` if no such process is
+    /// owned here — which lets `DELETE /processes/{id}` stay idempotent.
+    pub fn remove_by_id(&self, id: &str, sandbox_id: Option<&str>) -> Option<Arc<Proc>> {
+        let mut procs = self.procs.lock().unwrap();
+        let pos = procs
+            .iter()
+            .position(|p| p.id == id && (sandbox_id.is_none() || p.sandbox_id.as_deref() == sandbox_id))?;
+        Some(procs.remove(pos))
     }
 
     /// Whether `pid` exists and belongs to `sandbox_id` (host-mode scoping).
@@ -305,6 +333,31 @@ impl ProcRegistry {
                         "pid": p.pid,
                         "tag": p.tag,
                         "cmd": p.display,
+                        "started_at_ms": p.started_at_ms,
+                        "running": state.exit.is_none(),
+                        "exit_code": state.exit.and_then(|e| e.exit_code),
+                    })
+                })
+                .collect(),
+        )
+    }
+
+    /// List background processes for the `/processes` REST API: exposes the opaque
+    /// `id` and the original `cmd` value (unlike `list`, which returns the joined
+    /// display string under the legacy `/procs` route).
+    pub fn list_processes(&self, sandbox_id: Option<&str>) -> serde_json::Value {
+        let procs = self.procs.lock().unwrap();
+        serde_json::Value::Array(
+            procs
+                .iter()
+                .filter(|p| sandbox_id.is_none() || p.sandbox_id.as_deref() == sandbox_id)
+                .map(|p| {
+                    let state = p.state.lock().unwrap();
+                    serde_json::json!({
+                        "id": p.id,
+                        "pid": p.pid,
+                        "cmd": p.cmd_json,
+                        "tag": p.tag,
                         "started_at_ms": p.started_at_ms,
                         "running": state.exit.is_none(),
                         "exit_code": state.exit.and_then(|e| e.exit_code),
@@ -402,6 +455,13 @@ pub fn handle_exec(
     };
     spec.sandbox = sandbox;
 
+    if spec.background {
+        return match start_background(state, &spec) {
+            Ok(proc) => resp.json(200, &serde_json::json!({"pid": proc.pid, "tag": proc.tag})),
+            Err(e) => resp.error(400, &e),
+        };
+    }
+
     let (tx, rx) = mpsc::channel::<Event>();
     let started_at = now_ms();
     let (child, stdin) = match spawn(&spec, tx.clone()) {
@@ -409,35 +469,84 @@ pub fn handle_exec(
         Err(e) => return resp.error(400, &e),
     };
     let pid = child.id();
+    drop(stdin); // foreground without stdin payload: close the pipe immediately
+    wait_detached(child, started_at, spec.timeout_secs, tx);
+    resp.start_stream(200, "application/x-ndjson")?;
+    resp.chunk(format!("{}\n", serde_json::json!({"event": "start", "pid": pid})).as_bytes())?;
+    stream_events(&rx, resp)
+}
 
-    if spec.background {
-        let proc = Arc::new(Proc {
-            pid,
-            tag: spec.tag.clone(),
-            display: spec.display.clone(),
-            started_at_ms: started_at,
-            sandbox_id: spec.sandbox.as_ref().map(|s| s.id.clone()),
-            state: Mutex::new(ProcState {
-                events: Default::default(),
-                buffered_bytes: 0,
-                dropped_bytes: 0,
-                exit: None,
-                subscribers: Vec::new(),
-            }),
-            exited: Condvar::new(),
-            stdin: Mutex::new(stdin),
-        });
-        state.procs.insert(Arc::clone(&proc));
-        pump_background(proc, rx);
-        wait_detached(child, started_at, spec.timeout_secs, tx);
-        resp.json(200, &serde_json::json!({"pid": pid, "tag": spec.tag}))
-    } else {
-        drop(stdin); // foreground without stdin payload: close the pipe immediately
-        wait_detached(child, started_at, spec.timeout_secs, tx);
-        resp.start_stream(200, "application/x-ndjson")?;
-        resp.chunk(format!("{}\n", serde_json::json!({"event": "start", "pid": pid})).as_bytes())?;
-        stream_events(&rx, resp)
+/// Spawn `spec` as a background process, register it, and return the registry entry.
+/// Shared by `POST /exec {background:true}` and the `POST /processes` REST route.
+fn start_background(state: &Arc<State>, spec: &ExecSpec) -> Result<Arc<Proc>, String> {
+    let (tx, rx) = mpsc::channel::<Event>();
+    let started_at = now_ms();
+    let (child, stdin) = spawn(spec, tx.clone())?;
+    let proc = Arc::new(Proc {
+        id: state.procs.alloc_id(),
+        pid: child.id(),
+        tag: spec.tag.clone(),
+        display: spec.display.clone(),
+        cmd_json: spec.cmd_json.clone(),
+        started_at_ms: started_at,
+        sandbox_id: spec.sandbox.as_ref().map(|s| s.id.clone()),
+        state: Mutex::new(ProcState {
+            events: Default::default(),
+            buffered_bytes: 0,
+            dropped_bytes: 0,
+            exit: None,
+            subscribers: Vec::new(),
+        }),
+        exited: Condvar::new(),
+        stdin: Mutex::new(stdin),
+    });
+    state.procs.insert(Arc::clone(&proc));
+    pump_background(Arc::clone(&proc), rx);
+    wait_detached(child, started_at, spec.timeout_secs, tx);
+    Ok(proc)
+}
+
+/// `POST /processes` — start a background process and return its opaque `id`, `pid`
+/// and `cmd`. Body is the same shape as `/exec` (`background` is implied).
+pub fn handle_process_start(
+    state: &Arc<State>,
+    request: &mut Request,
+    reader: &mut BufReader<TcpStream>,
+    resp: &mut ResponseWriter,
+    sandbox: Option<Arc<crate::sandboxes::SandboxEntry>>,
+) -> std::io::Result<()> {
+    let body = read_body(request, reader, 16 * 1024 * 1024)?;
+    let json: serde_json::Value = match serde_json::from_slice(&body) {
+        Ok(v) => v,
+        Err(e) => return resp.error(400, &format!("invalid JSON body: {e}")),
+    };
+    let mut spec = match ExecSpec::from_json(&json) {
+        Ok(s) => s,
+        Err(e) => return resp.error(400, &e),
+    };
+    spec.background = true;
+    spec.sandbox = sandbox;
+    match start_background(state, &spec) {
+        Ok(proc) => resp.json(
+            200,
+            &serde_json::json!({"id": proc.id, "pid": proc.pid, "cmd": proc.cmd_json, "tag": proc.tag}),
+        ),
+        Err(e) => resp.error(400, &e),
     }
+}
+
+/// `DELETE /processes/{id}` — terminate a background process by its opaque id and
+/// forget it. Idempotent: an unknown id (or one owned by another sandbox) is a no-op.
+pub fn handle_process_delete(
+    state: &Arc<State>,
+    id: &str,
+    sandbox_id: Option<&str>,
+    resp: &mut ResponseWriter,
+) -> std::io::Result<()> {
+    if let Some(proc) = state.procs.remove_by_id(id, sandbox_id) {
+        kill_group(proc.pid, libc::SIGKILL);
+    }
+    resp.json(200, &serde_json::json!({"id": id, "ok": true}))
 }
 
 fn wait_detached(child: Child, started_at: i64, timeout_secs: Option<f64>, tx: Sender<Event>) {

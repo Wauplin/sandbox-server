@@ -95,6 +95,9 @@ fn route(
     match (method.as_str(), segments.as_slice()) {
         // ---- dedicated mode: operate directly on the job (one job == one sandbox) ----
         ("POST", ["v1", "exec"]) => exec::handle_exec(state, request, reader, resp, None),
+        ("POST", ["v1", "processes"]) => exec::handle_process_start(state, request, reader, resp, None),
+        ("GET", ["v1", "processes"]) => resp.json(200, &state.procs.list_processes(None)),
+        ("DELETE", ["v1", "processes", id]) => exec::handle_process_delete(state, id, None, resp),
         ("GET", ["v1", "procs"]) => resp.json(200, &state.procs.list(None)),
         ("GET", ["v1", "procs", pid, "logs"]) => exec::handle_logs(state, pid, &request.params, resp),
         ("GET", ["v1", "procs", pid, "wait"]) => exec::handle_wait(state, pid, resp),
@@ -128,6 +131,14 @@ fn route(
             Some(entry) => exec::handle_exec(state, request, reader, resp, Some(entry)),
             None => resp.error(404, &format!("no such sandbox: {id}")),
         },
+        ("POST", ["v1", "sandboxes", id, "processes"]) => match state.sandboxes.get(id) {
+            Some(entry) => exec::handle_process_start(state, request, reader, resp, Some(entry)),
+            None => resp.error(404, &format!("no such sandbox: {id}")),
+        },
+        ("GET", ["v1", "sandboxes", id, "processes"]) => resp.json(200, &state.procs.list_processes(Some(id))),
+        ("DELETE", ["v1", "sandboxes", id, "processes", proc_id]) => {
+            exec::handle_process_delete(state, proc_id, Some(id), resp)
+        }
         ("GET", ["v1", "sandboxes", id, "procs"]) => resp.json(200, &state.procs.list(Some(id))),
         ("GET", ["v1", "sandboxes", id, "procs", pid, "logs"]) => match parse_owned_pid(state, id, pid) {
             Ok(_) => exec::handle_logs(state, pid, &request.params, resp),

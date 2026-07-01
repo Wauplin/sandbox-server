@@ -44,6 +44,9 @@ GET  /health                              → {"status","version","uptime_ms"}  
 POST /v1/exec        {cmd, shell?, env?, cwd?, timeout?, stdin?, background?, tag?}
                      foreground → NDJSON stream: start / stdout / stderr / ping / exit
                      background → {"pid", "tag"}
+POST /v1/processes   {cmd, shell?, env?, cwd?, tag?}   → {"id", "pid", "cmd", "tag"}  (background)
+GET  /v1/processes                        → [{"id","pid","cmd","tag","running","exit_code",...}]
+DELETE /v1/processes/{id}                 → {"id","ok"}   (terminate + forget; idempotent)
 GET  /v1/procs                            → process list
 GET  /v1/procs/{pid}/logs?follow=         → NDJSON replay (+live)
 GET  /v1/procs/{pid}/wait                 → NDJSON pings until exit event
