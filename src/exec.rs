@@ -1,25 +1,23 @@
 //! Command execution: foreground (streamed NDJSON events) and background
-//! processes tracked in a registry with buffered logs.
+//! processes tracked in a registry.
 
 use std::collections::HashMap;
 use std::io::{BufReader, Read, Write};
 use std::net::TcpStream;
 use std::os::unix::process::CommandExt;
 use std::os::unix::process::ExitStatusExt;
-use std::process::{Child, ChildStdin, Command, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender};
-use std::sync::{mpsc, Arc, Condvar, Mutex};
+use std::sync::{mpsc, Arc, Mutex};
 use std::time::Duration;
 
-use crate::http::{read_body, stream_body, Request, ResponseWriter};
+use crate::http::{read_body, Request, ResponseWriter};
 use crate::{now_ms, State};
 
 /// Heartbeat interval for long-silent streams, to keep the proxy connection alive.
 const PING_INTERVAL: Duration = Duration::from_secs(15);
 /// Keepalive frame written on stream timeout (kept identical across all streams).
 const PING_CHUNK: &[u8] = b"{\"event\":\"ping\"}\n";
-/// Per-process buffered log budget for background processes.
-const LOG_BUFFER_BYTES: usize = 4 * 1024 * 1024;
 
 #[derive(Clone)]
 pub enum Event {
@@ -53,18 +51,10 @@ impl Event {
         line.push('\n');
         line
     }
-
-    fn byte_len(&self) -> usize {
-        match self {
-            Event::Stdout(d) | Event::Stderr(d) => d.len(),
-            Event::Exit(_) => 0,
-        }
-    }
 }
 
 pub struct ExecSpec {
     pub argv: Vec<String>,
-    pub display: String,
     /// The original `cmd` value verbatim (string or argv array), preserved so the
     /// `/processes` API can round-trip it back to the client unchanged.
     pub cmd_json: serde_json::Value,
@@ -85,9 +75,9 @@ impl ExecSpec {
         // from the type of `cmd` (string → shell, array → argv) for backward compatibility.
         // When set, it is authoritative and the type of `cmd` must match it.
         let shell = body.get("shell").and_then(|v| v.as_bool());
-        let (argv, display) = match (shell, body.get("cmd")) {
+        let argv: Vec<String> = match (shell, body.get("cmd")) {
             (Some(true) | None, Some(serde_json::Value::String(s))) => {
-                (vec!["/bin/sh".to_string(), "-c".to_string(), s.clone()], s.clone())
+                vec!["/bin/sh".to_string(), "-c".to_string(), s.clone()]
             }
             (Some(false) | None, Some(serde_json::Value::Array(items))) => {
                 let argv: Vec<String> = items
@@ -97,8 +87,7 @@ impl ExecSpec {
                 if argv.is_empty() {
                     return Err("cmd array must not be empty".into());
                 }
-                let display = argv.join(" ");
-                (argv, display)
+                argv
             }
             (Some(true), _) => return Err("shell=true requires 'cmd' to be a string".into()),
             (Some(false), _) => return Err("shell=false requires 'cmd' to be an array of strings".into()),
@@ -106,7 +95,6 @@ impl ExecSpec {
         };
         Ok(ExecSpec {
             argv,
-            display,
             cmd_json: body.get("cmd").cloned().unwrap_or(serde_json::Value::Null),
             env: crate::json_string_map(body, "env"),
             cwd: body.get("cwd").and_then(|v| v.as_str()).map(String::from),
@@ -127,11 +115,11 @@ fn kill_group(pid: u32, signal: i32) {
 }
 
 /// Spawns the process and wires up reader/waiter threads that push events to `tx`.
-fn spawn(spec: &ExecSpec, tx: Sender<Event>) -> Result<(Child, Option<ChildStdin>), String> {
+fn spawn(spec: &ExecSpec, tx: Sender<Event>) -> Result<Child, String> {
     let mut command = Command::new(&spec.argv[0]);
     command
         .args(&spec.argv[1..])
-        .stdin(if spec.stdin.is_some() || spec.background { Stdio::piped() } else { Stdio::null() })
+        .stdin(if spec.stdin.is_some() { Stdio::piped() } else { Stdio::null() })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .process_group(0);
@@ -150,13 +138,12 @@ fn spawn(spec: &ExecSpec, tx: Sender<Event>) -> Result<(Child, Option<ChildStdin
     command.envs(&spec.env);
     let mut child = command.spawn().map_err(|e| format!("failed to spawn '{}': {e}", spec.argv[0]))?;
 
-    let mut stdin = child.stdin.take();
+    // Optional one-shot stdin payload: write it then drop the pipe (-> EOF).
     if let Some(input) = &spec.stdin {
-        if let Some(mut pipe) = stdin.take() {
+        if let Some(mut pipe) = child.stdin.take() {
             let data = input.clone().into_bytes();
             std::thread::spawn(move || {
                 let _ = pipe.write_all(&data);
-                // pipe dropped here -> EOF
             });
         }
     }
@@ -166,7 +153,7 @@ fn spawn(spec: &ExecSpec, tx: Sender<Event>) -> Result<(Child, Option<ChildStdin
     spawn_reader(stdout, tx.clone(), Event::Stdout);
     spawn_reader(stderr, tx.clone(), Event::Stderr);
 
-    Ok((child, stdin))
+    Ok(child)
 }
 
 fn spawn_reader(mut pipe: impl Read + Send + 'static, tx: Sender<Event>, make: fn(String) -> Event) {
@@ -227,11 +214,7 @@ fn wait_and_report(mut child: Child, started_at: i64, timeout_secs: Option<f64>,
 // ---------------------------------------------------------------------------
 
 pub struct ProcState {
-    pub events: std::collections::VecDeque<Event>,
-    pub buffered_bytes: usize,
-    pub dropped_bytes: u64,
     pub exit: Option<ExitInfo>,
-    pub subscribers: Vec<Sender<Event>>,
 }
 
 pub struct Proc {
@@ -240,15 +223,12 @@ pub struct Proc {
     pub id: String,
     pub pid: u32,
     pub tag: Option<String>,
-    pub display: String,
     /// Original `cmd` value (string or argv array), echoed back by `/processes`.
     pub cmd_json: serde_json::Value,
     pub started_at_ms: i64,
     /// Owning sandbox id in host mode (None for dedicated-mode processes).
     pub sandbox_id: Option<String>,
     pub state: Mutex<ProcState>,
-    pub exited: Condvar,
-    pub stdin: Mutex<Option<ChildStdin>>,
 }
 
 #[derive(Default)]
@@ -269,10 +249,6 @@ impl ProcRegistry {
         format!("p-{n}")
     }
 
-    pub fn get(&self, pid: u32) -> Option<Arc<Proc>> {
-        self.procs.lock().unwrap().iter().find(|p| p.pid == pid).cloned()
-    }
-
     /// Remove the process with opaque `id` (optionally scoped to `sandbox_id` in host
     /// mode) and return it so the caller can signal it. `None` if no such process is
     /// owned here — which lets `DELETE /processes/{id}` stay idempotent.
@@ -282,15 +258,6 @@ impl ProcRegistry {
             .iter()
             .position(|p| p.id == id && (sandbox_id.is_none() || p.sandbox_id.as_deref() == sandbox_id))?;
         Some(procs.remove(pos))
-    }
-
-    /// Whether `pid` exists and belongs to `sandbox_id` (host-mode scoping).
-    pub fn belongs(&self, pid: u32, sandbox_id: &str) -> bool {
-        self.procs
-            .lock()
-            .unwrap()
-            .iter()
-            .any(|p| p.pid == pid && p.sandbox_id.as_deref() == Some(sandbox_id))
     }
 
     /// Forget all processes owned by a sandbox (called when it is deleted) so the
@@ -319,32 +286,8 @@ impl ProcRegistry {
             .count()
     }
 
-    /// List processes. In host mode pass `Some(sandbox_id)` to list only that
-    /// sandbox's processes; pass `None` for the dedicated-mode global list.
-    pub fn list(&self, sandbox_id: Option<&str>) -> serde_json::Value {
-        let procs = self.procs.lock().unwrap();
-        serde_json::Value::Array(
-            procs
-                .iter()
-                .filter(|p| sandbox_id.is_none() || p.sandbox_id.as_deref() == sandbox_id)
-                .map(|p| {
-                    let state = p.state.lock().unwrap();
-                    serde_json::json!({
-                        "pid": p.pid,
-                        "tag": p.tag,
-                        "cmd": p.display,
-                        "started_at_ms": p.started_at_ms,
-                        "running": state.exit.is_none(),
-                        "exit_code": state.exit.and_then(|e| e.exit_code),
-                    })
-                })
-                .collect(),
-        )
-    }
-
-    /// List background processes for the `/processes` REST API: exposes the opaque
-    /// `id` and the original `cmd` value (unlike `list`, which returns the joined
-    /// display string under the legacy `/procs` route).
+    /// List background processes. In host mode pass `Some(sandbox_id)` to list only
+    /// that sandbox's processes; pass `None` for the dedicated-mode global list.
     pub fn list_processes(&self, sandbox_id: Option<&str>) -> serde_json::Value {
         let procs = self.procs.lock().unwrap();
         serde_json::Value::Array(
@@ -368,30 +311,13 @@ impl ProcRegistry {
     }
 }
 
-/// Fans events from the process into the registry entry (ring buffer + live subscribers).
+/// Drains the background process's output (not buffered — `/processes` doesn't expose
+/// logs) and records the final exit status so the process list can report it.
 fn pump_background(proc: Arc<Proc>, rx: Receiver<Event>) {
     std::thread::spawn(move || {
         for event in rx {
-            let is_exit = matches!(event, Event::Exit(_));
-            let mut state = proc.state.lock().unwrap();
-            if let Event::Exit(info) = &event {
-                state.exit = Some(*info);
-            }
-            state.buffered_bytes += event.byte_len();
-            state.events.push_back(event.clone());
-            while state.buffered_bytes > LOG_BUFFER_BYTES {
-                if let Some(old) = state.events.pop_front() {
-                    state.buffered_bytes -= old.byte_len();
-                    state.dropped_bytes += old.byte_len() as u64;
-                } else {
-                    break;
-                }
-            }
-            state.subscribers.retain(|sub| sub.send(event.clone()).is_ok());
-            if is_exit {
-                state.subscribers.clear();
-                drop(state);
-                proc.exited.notify_all();
+            if let Event::Exit(info) = event {
+                proc.state.lock().unwrap().exit = Some(info);
                 break;
             }
         }
@@ -401,22 +327,6 @@ fn pump_background(proc: Arc<Proc>, rx: Receiver<Event>) {
 // ---------------------------------------------------------------------------
 // HTTP handlers
 // ---------------------------------------------------------------------------
-
-/// Look up a process by its (string) pid, replying 404 if it doesn't exist.
-/// `Ok(None)` means the 404 was already written and the caller should return.
-fn require_proc(
-    state: &Arc<State>,
-    pid: &str,
-    resp: &mut ResponseWriter,
-) -> std::io::Result<Option<Arc<Proc>>> {
-    match pid.parse().ok().and_then(|pid| state.procs.get(pid)) {
-        Some(proc) => Ok(Some(proc)),
-        None => {
-            resp.error(404, &format!("no such process: {pid}"))?;
-            Ok(None)
-        }
-    }
-}
 
 /// Streams events from `rx` as NDJSON chunks until Exit, with keepalive pings.
 fn stream_events(rx: &Receiver<Event>, resp: &mut ResponseWriter) -> std::io::Result<()> {
@@ -464,12 +374,11 @@ pub fn handle_exec(
 
     let (tx, rx) = mpsc::channel::<Event>();
     let started_at = now_ms();
-    let (child, stdin) = match spawn(&spec, tx.clone()) {
-        Ok(pair) => pair,
+    let child = match spawn(&spec, tx.clone()) {
+        Ok(child) => child,
         Err(e) => return resp.error(400, &e),
     };
     let pid = child.id();
-    drop(stdin); // foreground without stdin payload: close the pipe immediately
     wait_detached(child, started_at, spec.timeout_secs, tx);
     resp.start_stream(200, "application/x-ndjson")?;
     resp.chunk(format!("{}\n", serde_json::json!({"event": "start", "pid": pid})).as_bytes())?;
@@ -481,24 +390,15 @@ pub fn handle_exec(
 fn start_background(state: &Arc<State>, spec: &ExecSpec) -> Result<Arc<Proc>, String> {
     let (tx, rx) = mpsc::channel::<Event>();
     let started_at = now_ms();
-    let (child, stdin) = spawn(spec, tx.clone())?;
+    let child = spawn(spec, tx.clone())?;
     let proc = Arc::new(Proc {
         id: state.procs.alloc_id(),
         pid: child.id(),
         tag: spec.tag.clone(),
-        display: spec.display.clone(),
         cmd_json: spec.cmd_json.clone(),
         started_at_ms: started_at,
         sandbox_id: spec.sandbox.as_ref().map(|s| s.id.clone()),
-        state: Mutex::new(ProcState {
-            events: Default::default(),
-            buffered_bytes: 0,
-            dropped_bytes: 0,
-            exit: None,
-            subscribers: Vec::new(),
-        }),
-        exited: Condvar::new(),
-        stdin: Mutex::new(stdin),
+        state: Mutex::new(ProcState { exit: None }),
     });
     state.procs.insert(Arc::clone(&proc));
     pump_background(Arc::clone(&proc), rx);
@@ -551,119 +451,4 @@ pub fn handle_process_delete(
 
 fn wait_detached(child: Child, started_at: i64, timeout_secs: Option<f64>, tx: Sender<Event>) {
     std::thread::spawn(move || wait_and_report(child, started_at, timeout_secs, tx));
-}
-
-pub fn handle_logs(
-    state: &Arc<State>,
-    pid: &str,
-    params: &HashMap<String, String>,
-    resp: &mut ResponseWriter,
-) -> std::io::Result<()> {
-    let Some(proc) = require_proc(state, pid, resp)? else { return Ok(()) };
-    let follow = crate::http::bool_param(params, "follow", false);
-
-    resp.start_stream(200, "application/x-ndjson")?;
-
-    // Snapshot buffered events and (if following) subscribe atomically, so no
-    // event is missed or duplicated between replay and live streaming.
-    let (snapshot, rx) = {
-        let mut proc_state = proc.state.lock().unwrap();
-        let snapshot: Vec<Event> = proc_state.events.iter().cloned().collect();
-        let exited = proc_state.exit.is_some();
-        let rx = if follow && !exited {
-            let (tx, rx) = mpsc::channel();
-            proc_state.subscribers.push(tx);
-            Some(rx)
-        } else {
-            None
-        };
-        (snapshot, rx)
-    };
-
-    for event in &snapshot {
-        resp.chunk(event.to_line().as_bytes())?;
-    }
-    // If the proc exited between lookup and subscribe, `rx` is None and the
-    // snapshot above already carried the Exit event — nothing left to stream.
-    if let Some(rx) = rx {
-        stream_events(&rx, resp)?;
-    }
-    Ok(())
-}
-
-pub fn handle_wait(state: &Arc<State>, pid: &str, resp: &mut ResponseWriter) -> std::io::Result<()> {
-    let Some(proc) = require_proc(state, pid, resp)? else { return Ok(()) };
-    resp.start_stream(200, "application/x-ndjson")?;
-    let mut guard = proc.state.lock().unwrap();
-    loop {
-        if let Some(info) = guard.exit {
-            drop(guard);
-            return resp.chunk(Event::Exit(info).to_line().as_bytes());
-        }
-        let (g, timeout) = proc.exited.wait_timeout(guard, PING_INTERVAL).unwrap();
-        guard = g;
-        if timeout.timed_out() {
-            // keepalive ping; must temporarily release the lock to write
-            drop(guard);
-            resp.chunk(b"{\"event\":\"ping\"}\n")?;
-            guard = proc.state.lock().unwrap();
-        }
-    }
-}
-
-pub fn handle_kill(
-    state: &Arc<State>,
-    request: &mut Request,
-    reader: &mut BufReader<TcpStream>,
-    pid: &str,
-    resp: &mut ResponseWriter,
-) -> std::io::Result<()> {
-    let body = read_body(request, reader, 1024 * 1024)?;
-    let json: serde_json::Value = serde_json::from_slice(&body).unwrap_or(serde_json::json!({}));
-    let Some(proc) = require_proc(state, pid, resp)? else { return Ok(()) };
-    let signal = match json.get("signal") {
-        Some(serde_json::Value::String(s)) => match s.to_uppercase().as_str() {
-            "TERM" | "SIGTERM" => libc::SIGTERM,
-            "KILL" | "SIGKILL" => libc::SIGKILL,
-            "INT" | "SIGINT" => libc::SIGINT,
-            "HUP" | "SIGHUP" => libc::SIGHUP,
-            other => return resp.error(400, &format!("unknown signal: {other}")),
-        },
-        Some(serde_json::Value::Number(n)) => n.as_i64().unwrap_or(libc::SIGKILL as i64) as i32,
-        _ => libc::SIGKILL,
-    };
-    kill_group(proc.pid, signal);
-    resp.json(200, &serde_json::json!({"pid": proc.pid, "signal": signal}))
-}
-
-pub fn handle_stdin(
-    state: &Arc<State>,
-    request: &mut Request,
-    reader: &mut BufReader<TcpStream>,
-    pid: &str,
-    resp: &mut ResponseWriter,
-) -> std::io::Result<()> {
-    let Some(proc) = require_proc(state, pid, resp)? else { return Ok(()) };
-    let eof = crate::http::bool_param(&request.params, "eof", false);
-    let mut stdin_guard = proc.stdin.lock().unwrap();
-    let Some(stdin) = stdin_guard.as_mut() else {
-        return resp.error(409, "stdin not available for this process");
-    };
-    let mut write_error = None;
-    let written = stream_body(request, reader, |chunk| {
-        if write_error.is_none() {
-            if let Err(e) = stdin.write_all(chunk) {
-                write_error = Some(e.to_string());
-            }
-        }
-        Ok(())
-    })?;
-    if let Some(e) = write_error {
-        return resp.error(409, &format!("failed to write to stdin: {e}"));
-    }
-    let _ = stdin.flush();
-    if eof {
-        *stdin_guard = None; // drop -> close pipe
-    }
-    resp.json(200, &serde_json::json!({"written": written, "eof": eof}))
 }
