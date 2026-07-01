@@ -282,7 +282,13 @@ pub fn pre_exec_isolation(entry: &SandboxEntry) -> impl FnMut() -> std::io::Resu
 /// it may contain job secrets that belong to the host, not the sandboxes).
 pub fn base_env(entry: &SandboxEntry) -> Vec<(String, String)> {
     let mut env = vec![
-        ("PATH".to_string(), "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin".to_string()),
+        // `~/.local/bin` first: a Landlock-confined sandbox can't write to the system
+        // site (/usr is read-only), so `pip install` falls back to a `--user` install
+        // there — its console scripts (uvicorn, ...) must be on PATH to be runnable.
+        (
+            "PATH".to_string(),
+            format!("{}/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin", entry.home),
+        ),
         ("HOME".to_string(), entry.home.clone()),
         ("TMPDIR".to_string(), format!("{}/.tmp", entry.home)),
         ("USER".to_string(), format!("sbx-{}", entry.id)),
